@@ -9,13 +9,13 @@ long_description = (base_path / "README.md").read_text()
 
 setuptools.setup(
   name="poe-api",
-  version="0.4.17",
+  version="0.5.3",
   author="ading2210",
   license="GPLv3",
   description="A reverse engineered API wrapper for Quora's Poe",
   long_description=long_description,
   long_description_content_type="text/markdown",
-  packages=["poe_graphql"],
+  packages=["poe"],
   classifiers=[
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: GNU General Public License (GPL)",
@@ -23,17 +23,16 @@ setuptools.setup(
   ],
   python_requires=">=3.7",
   package_dir={
-    "": "poe-api/src"
+    "": "src"
   },
   package_data={
-    "poe_graphql": ["*.graphql"]
+    "poe": ["poe_graphql/*.json"]
   },
-  py_modules=["poe"],
   include_package_data=True,
   install_requires=[
     "websocket-client",
-    "requests[socks]",
-    "python-socks",
+    "httpx",
+    "brotlicffi",
     "tls_client",
     "quickjs"
   ],

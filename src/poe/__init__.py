@@ -1,7 +1,6 @@
 import re, json, random, logging, time, queue, threading, traceback, hashlib, string, random, os
 import quickjs
-import requests
-import tls_client as requests_tls
+import httpx
 import secrets
 import websocket
 import uuid
@@ -10,7 +9,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 parent_path = Path(__file__).resolve().parent
-queries_path = parent_path / "poe_graphql"
+queries_path = parent_path / "poe_graphql" / "queries.json"
 queries = {}
 
 logging.basicConfig()
@@ -29,18 +28,20 @@ headers = {
 }
 client_identifier = "chrome112"
 
-def load_queries():
-  for path in queries_path.iterdir():
-    if path.suffix != ".graphql":
-      continue
-    with open(path) as f:
-      queries[path.stem] = f.read()
+#load gql queries
+try:
+  queries = json.loads(queries_path.read_text())
+except FileNotFoundError:
+  logger.error("GraphQL queries file not found.")
+  queries = {}
 
 def generate_payload(query_name, variables):
   if query_name == "recv":
     return generate_recv_payload(variables)
   return {
-    "query": queries[query_name],
+    "extensions": {
+      "hash": queries[query_name]
+    },  
     "queryName": query_name,
     "variables": variables
   }
@@ -155,10 +156,15 @@ class Client:
 
   def setup_session(self):
     logger.info("Setting up session...")
+    self.session = httpx.Client()
+
+    """
     if self.client_identifier:
       self.session = requests_tls.Session(client_identifier=self.client_identifier)
     else:
       self.session = requests.Session()
+    """
+
 
     if self.proxy:
       self.session.proxies = {
@@ -180,6 +186,12 @@ class Client:
     self.next_data = self.get_next_data(overwrite_vars=True)
     self.channel = self.get_channel_data()
 
+    self.gql_headers = {
+      "poe-formkey": self.formkey,
+      "poe-tchannel": self.channel["channel"],
+    }
+    self.gql_headers = {**self.gql_headers, **self.headers}
+
     if not hasattr(self, "bots"):
       self.bots = self.get_bots(download_next_data=False)
     if not hasattr(self, "bot_names"):
@@ -188,11 +200,6 @@ class Client:
     if self.device_id is None:
       self.device_id = self.get_device_id()
 
-    self.gql_headers = {
-      "poe-formkey": self.formkey,
-      "poe-tchannel": self.channel["channel"],
-    }
-    self.gql_headers = {**self.gql_headers, **self.headers}
     self.subscribe()
 
   def get_device_id(self):
@@ -200,8 +207,6 @@ class Client:
     device_id = get_saved_device_id(user_id)
     return device_id
 
-  #i find it funny how the contents of this function will lead 
-  #to the formkey function getting changed a few hours later
   def extract_formkey(self, html, app_script):
     script_regex = r'<script>(.+?)</script>'
     vars_regex = r'window\._([a-zA-Z0-9]{10})="([a-zA-Z0-9]{10})"'
@@ -209,23 +214,33 @@ class Client:
 
     script_text = """
       let QuickJS = undefined, process = undefined;
+      let document = {a: 1};
       let window = {
-        document: {a:1},
         navigator: {
           userAgent: "a"
         }
       };
     """
     script_text += f"window._{key} = '{value}';"
-    script_text += "".join(re.findall(script_regex, html))
+    script_text += "".join(re.findall(script_regex, html)[:2])
 
     function_regex = r'(window\.[a-zA-Z0-9]{17})=function'
     function_text = re.search(function_regex, script_text).group(1)
     script_text += f"{function_text}();"
-
+    
     context = quickjs.Context()
     formkey = context.eval(script_text)
-    return formkey
+
+    salt = None
+    try:
+      salt_function_regex = r'function (.)\(_0x[0-9a-f]{6},_0x[0-9a-f]{6},_0x[0-9a-f]{6}\)'
+      salt_function = re.search(salt_function_regex, script_text).group(1)
+      salt_script = f"{salt_function}(a=>a, '', '');"
+      salt = context.eval(salt_script)
+    except Exception as e:
+      logger.warn("Failed to obtain poe-tag-id salt: "+str(e))
+
+    return formkey, salt
 
   def get_next_data(self, overwrite_vars=False):
     logger.info("Downloading next_data...")
@@ -240,7 +255,10 @@ class Client:
         script_src_regex = r'src="(https://psc2\.cf2\.poecdn\.net/[a-f0-9]{40}/_next/static/chunks/pages/_app-[a-f0-9]{16}\.js)"'
         script_src = re.search(script_src_regex, r.text).group(1)
         r2 = request_with_retries(self.session.get, script_src)
-        self.formkey = self.extract_formkey(r.text, r2.text)
+        self.formkey, self.formkey_salt = self.extract_formkey(r.text, r2.text)
+      
+      if self.formkey_salt is None:
+        self.formkey_salt = "4LxgHM6KpFqokX0Ox"
 
       if "payload" in next_data["props"]["pageProps"]:
         self.viewer = next_data["props"]["pageProps"]["payload"]["viewer"]
@@ -260,15 +278,22 @@ class Client:
 
   def get_bots(self, download_next_data=True):
     logger.info("Downloading all bots...")
-    if download_next_data:
-      next_data = self.get_next_data(overwrite_vars=True)
-    else:
-      next_data = self.next_data
-
     if not "availableBotsConnection" in self.viewer:
       raise RuntimeError("Invalid token or no bots are available.")
-    bot_list_url = f'https://poe.com/_next/data/{self.next_data["buildId"]}/index.json'
-    bot_list = self.viewer["availableBotsConnection"]["edges"]
+    
+    bot_list_data = self.send_query("BotSwitcherModalQuery", {})["data"]["viewer"]["availableBotsConnection"]
+    bot_list = bot_list_data["edges"]
+    next_page = bot_list_data["pageInfo"]["hasNextPage"]
+    end_cursor = bot_list_data["pageInfo"]["endCursor"]
+
+    while next_page:
+      bot_list_data = self.send_query("AvailableBotsListModalPaginationQuery", {
+        "cursor": end_cursor,
+        "limit": 10
+      })["data"]["viewer"]["availableBotsConnection"]
+      bot_list += bot_list_data["edges"]
+      next_page = bot_list_data["pageInfo"]["hasNextPage"]
+      end_cursor = bot_list_data["pageInfo"]["endCursor"]
 
     threads = []
     bots = {}
@@ -353,7 +378,7 @@ class Client:
       json_data = generate_payload(query_name, variables)
       payload = json.dumps(json_data, separators=(",", ":"))
 
-      base_string = payload + self.gql_headers["poe-formkey"] + "Jb1hi3fg1MxZpzYfy"
+      base_string = payload + self.gql_headers["poe-formkey"] + self.formkey_salt
 
       headers = {
         "content-type": "application/json",
@@ -382,11 +407,13 @@ class Client:
       "subscriptions": [
         {
           "subscriptionName": "messageAdded",
-          "query": queries["MessageAddedSubscription"]
+          "queryHash": queries["MessageAdded"],
+          "query": None
         },
         {
           "subscriptionName": "viewerStateUpdated",
-          "query": queries["ViewerStateUpdatedSubscription"]
+          "queryHash": queries["ViewerStateUpdated"],
+          "query": None
         }
       ]
     })
@@ -509,6 +536,9 @@ class Client:
       logger.error(traceback.format_exc())
       self.disconnect_ws()
       self.connect_ws()
+    
+  def is_busy(self):
+    return bool(self.active_messages)
 
   def send_message(self, chatbot, message, with_chat_break=False, timeout=20, async_recv=True, suggest_callback=None):
     # if there is another active message, wait until it has finished sending
@@ -536,10 +566,16 @@ class Client:
         "bot": chatbot,
         "query": message,
         "chatId": chat_id,
-        "source": None,
+        "source": {
+          "chatInputMetadata": {
+            "useVoiceRecord": False
+          },
+          "sourceType": "chat_input"
+        },
         "clientNonce": generate_nonce(),
         "sdid": self.device_id,
         "withChatBreak": with_chat_break,
+        "attachments": []
       })
       del self.active_messages["pending"]
     except Exception as e:
@@ -617,9 +653,10 @@ class Client:
 
   def send_chat_break(self, chatbot):
     logger.info(f"Sending chat break to {chatbot}")
-    result = self.send_query("AddMessageBreakMutation", {
-      "chatId": self.get_bot_by_codename(chatbot)["chatId"]}
-    )
+    result = self.send_query("AddMessageBreakEdgeMutation", {
+      "chatId": self.get_bot_by_codename(chatbot)["chatId"],
+      "connections": []
+    })
     return result["data"]["messageBreakEdgeCreate"]["message"]
 
   def get_message_history(self, chatbot, count=25, cursor=None):
@@ -664,7 +701,7 @@ class Client:
     if not type(message_ids) is list:
       message_ids = [int(message_ids)]
 
-    result = self.send_query("DeleteMessageMutation", {
+    result = self.send_query("DeleteUserMessagesMutation", {
       "messageIds": message_ids
     })
 
@@ -692,7 +729,7 @@ class Client:
                   prompt_public=True, pfp_url=None, linkification=False,
                   markdown_rendering=True, suggested_replies=False, private=False,
                   temperature=None):
-    result = self.send_query("PoeBotCreateMutation", {
+    result = self.send_query("PoeBotCreate", {
       "model": base_model,
       "displayName": display_name,
       "handle": handle,
@@ -726,7 +763,7 @@ class Client:
       bot_id = self.get_bot(handle)["defaultBotObject"]["botId"]
     new_handle = new_handle or handle
     
-    result = self.send_query("PoeBotEditMutation", {
+    result = self.send_query("PoeBotEdit", {
       "baseBot": base_model,
       "botId": bot_id,
       "handle": new_handle,
@@ -754,5 +791,3 @@ class Client:
   def purge_all_conversations(self):
     logger.info("Purging all conversations")
     self.send_query("DeleteUserMessagesMutation", {})
-
-load_queries()

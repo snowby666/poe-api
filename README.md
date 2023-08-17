@@ -100,13 +100,17 @@ The client downloads all of the available bots upon initialization and stores th
 print(json.dumps(client.bot_names, indent=2))
 """
 {
-  "capybara": "Assistant",
   "chinchilla": "ChatGPT",
-  "beaver": "GPT-4",
-  "a2_100k": "Claude-instant-100k",
   "a2": "Claude-instant",
-  "agouti": "ChatGPT-16k",
+  "capybara": "Assistant",
+  "a2_100k": "Claude-instant-100k",
+  "llama_2_7b_chat": "Llama-2-7b",
+  "llama_2_13b_chat": "Llama-2-13b",
   "a2_2": "Claude-2-100k",
+  "llama_2_70b_chat": "Llama-2-70b",
+  "agouti": "ChatGPT-16k",
+  "beaver": "GPT-4",
+  "vizcacha": "GPT-4-32k",
   "acouchy": "Google-PaLM"
 }
 """
@@ -231,6 +235,8 @@ print(chunk["text"])
 ```
 
 You can also send multiple messages in parallel using `threading` and receive their responses separately, as demonstrated in `/examples/parallel_messages.py`. Note that if you send messages too fast, the server will give an error, but the request will eventually succeed.
+
+The `client.is_busy` function can be used to check if there is currently a message being received.
 
 #### Clearing the Conversation Context:
 If you want to clear the the context of a conversation without sending a message, you can use `client.send_chat_break`. The only argument is the codename of the bot whose context will be cleared.
